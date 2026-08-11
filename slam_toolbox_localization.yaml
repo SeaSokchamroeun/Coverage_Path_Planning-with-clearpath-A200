@@ -1,0 +1,73 @@
+# PREREQUISITE -- read before using this file:
+# SLAM Toolbox's localization mode does NOT load a plain .pgm/.yaml
+# occupancy grid (what AMCL/office_map.yaml uses). It loads a serialized
+# pose-graph (a <name>.posegraph + <name>.data pair) produced by
+# SLAM Toolbox itself. Your existing office_map was almost certainly
+# saved with `nav2 map_saver_cli` (pgm/yaml only, no posegraph) -- check
+# for a matching .posegraph file next to office_map.yaml before assuming
+# you have one.
+#
+# If you don't have it yet, produce it once:
+#   1. Launch SLAM Toolbox in the SAME async/online mapping mode used
+#      originally (Section 3.4 of the report) and re-drive (or replay)
+#      the same perimeter pass.
+#   2. Before shutting it down, call:
+#        ros2 service call /a200_1103/slam_toolbox/serialize_map \
+#          slam_toolbox/srv/SerializePoseGraph "{filename: '/home/<user>/clearpath/office_map_graph'}"
+#      This writes office_map_graph.posegraph + office_map_graph.data.
+#   3. Point map_file_name below at that path (no extension).
+# Skipping this step means localization mode has nothing to load and
+# will fail at startup -- verify the two files exist before your first
+# comparison run, not after.
+
+slam_toolbox:
+  ros__parameters:
+    solver_plugin: solver_plugins::CeresSolver
+    ceres_linear_solver: SPARSE_NORMAL_CHOLESKY
+    ceres_preconditioner: SCHUR_JACOBI
+    ceres_trust_strategy: LEVENBERG_MARQUARDT
+    ceres_dogleg_type: TRADITIONAL_DOGLEG
+    ceres_loss_function: None
+
+    mode: localization
+    # No extension -- SLAM Toolbox appends .posegraph / .data itself.
+    map_file_name: /home/rbt-roeun/clearpath/office_map_graph
+    map_start_pose: [0.0, 0.0, 0.0]
+
+    odom_frame: odom
+    map_frame: map
+    base_frame: base_link
+    scan_topic: sensors/lidar2d_0/scan
+
+    debug_logging: false
+    throttle_scans: 1
+    transform_publish_period: 0.02
+    map_update_interval: 5.0
+    resolution: 0.05
+    # Matches the AMCL config's corrected value (was left at the
+    # AMCL default of 100.0 there too before this project's fix) --
+    # actual sensor is a Hokuyo UST, real range ~10-30m.
+    max_laser_range: 20.0
+    minimum_time_interval: 0.5
+    transform_timeout: 0.2
+    tf_buffer_duration: 30.0
+    stack_size_to_use: 40000000
+    enable_interactive_mode: false
+
+    # Localization-mode-specific: how much SLAM Toolbox is allowed to
+    # keep refining the existing graph vs. treat it as fixed ground
+    # truth. Kept conservative (small correlation search window) since
+    # the goal here is robust re-localization against a known-good map,
+    # not continued mapping.
+    minimum_travel_distance: 0.2
+    minimum_travel_heading: 0.2
+    scan_buffer_size: 10
+    scan_buffer_maximum_scan_distance: 10.0
+    link_match_minimum_response_fine: 0.1
+    link_scan_maximum_distance: 1.5
+    loop_search_maximum_distance: 3.0
+    do_loop_closing: false
+    loop_match_minimum_chain_size: 10
+    loop_match_maximum_variance_coarse: 3.0
+    loop_match_minimum_response_coarse: 0.35
+    loop_match_minimum_response_fine: 0.45

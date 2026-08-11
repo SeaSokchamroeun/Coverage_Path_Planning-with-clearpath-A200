@@ -1,0 +1,15 @@
+__pycache__/
+pycache/
+*.pyc
+*.backup
+*.prev
+*.prepatch_backup
+coveragePathPlanning/run_coverage_OLD_broken.py
+coveragePathPlanning/run_coverage_log*.txt
+eval_logs/
+coveragePathPlanning/coverage_debug*.png
+coveragePathPlanning/boundary_debug.png
+check.txt
+check_results.txt
+husky_map.pgm
+husky_map.yaml
