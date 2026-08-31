@@ -1,35 +1,14 @@
 #!/usr/bin/env python3
-"""
-slam_toolbox_localization_launch.py
-
-Drop-in alternative to localization_custom_launch.py (which brings up
-map_server + AMCL). This brings up SLAM Toolbox's own localization-mode
-launch file instead, with our params overlaid -- same pattern this
-project already uses for AMCL (include the vendor/package launch file,
-override params_file, don't reimplement its internals). Never run this
-alongside localization_custom_launch.py: only one node may own the
-map->odom transform, same lesson as the duplicate Route Server bug
-(Section 4.7 of the report).
-
-PREREQUISITE: see the comment block at the top of
-slam_toolbox_localization.yaml -- this needs a serialized .posegraph
-map, not the plain office_map.pgm/.yaml AMCL uses. Verify both files
-exist before your first comparison run.
-
-Run this AFTER simulation.launch.py, IN PLACE OF localization_custom_launch.py:
-  ros2 launch <pkg> slam_toolbox_localization_launch.py
-Then run_coverage.py and log_localization_covariance.py exactly as with
-the AMCL arm -- only the pose topic name changes (see --topic in the
-logger); Nav2 and run_coverage.py are unaffected either way since both
-localization nodes provide the same map->odom TF contract.
-"""
 import os
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, GroupAction, IncludeLaunchDescription, OpaqueFunction
-from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
-from launch_ros.actions import PushRosNamespace
-from ament_index_python.packages import get_package_share_directory
+from launch.actions import DeclareLaunchArgument, EmitEvent, GroupAction, RegisterEventHandler
+from launch.conditions import IfCondition
+from launch_ros.event_handlers import OnStateTransition
+from launch.events import matches_action
+from launch.substitutions import LaunchConfiguration
+from launch_ros.actions import LifecycleNode, PushRosNamespace
+from launch_ros.events.lifecycle import ChangeState
+from lifecycle_msgs.msg import Transition
 
 NAMESPACE = 'a200_1103'
 HOME      = os.path.expanduser('~')
@@ -37,25 +16,75 @@ PARAMS    = os.path.join(HOME, 'clearpath', 'slam_toolbox_localization.yaml')
 
 ARGUMENTS = [
     DeclareLaunchArgument('use_sim_time', default_value='true', choices=['true', 'false']),
+    DeclareLaunchArgument('autostart', default_value='true'),
 ]
 
-def launch_setup(context, *args, **kwargs):
-    pkg_slam_toolbox = get_package_share_directory('slam_toolbox')
+def generate_launch_description():
+    use_sim_time = LaunchConfiguration('use_sim_time')
+    autostart    = LaunchConfiguration('autostart')
+
+    # /tf and /tf_static don't automatically follow PushRosNamespace the
+    # way ordinary topics do -- without an explicit remap, the node
+    # broadcasts transforms to the global /tf topic instead of the
+    # namespaced /a200_1103/tf that RViz and everything else in this
+    # project listens on. This is exactly why RViz showed "Frame [map]
+    # does not exist" despite the node being confirmed active: it WAS
+    # broadcasting map->odom, just to the wrong topic. nav2_bringup's own
+    # localization_launch.py (the AMCL one) already does this remap on
+    # every node it launches -- this file just never had it copied over.
+    remappings = [('/tf', 'tf'), ('/tf_static', 'tf_static')]
+
+    slam_toolbox_node = LifecycleNode(
+        package='slam_toolbox',
+        executable='localization_slam_toolbox_node',
+        name='slam_toolbox',
+        namespace='',
+        output='screen',
+        parameters=[PARAMS, {'use_sim_time': use_sim_time}],
+        remappings=remappings,
+    )
+
+    configure_event = EmitEvent(
+        event=ChangeState(
+            lifecycle_node_matcher=matches_action(slam_toolbox_node),
+            transition_id=Transition.TRANSITION_CONFIGURE,
+        ),
+        condition=IfCondition(autostart),
+    )
+
+    # slam_toolbox does NOT self-activate after configure -- it was
+    # assumed to, based on official slam_toolbox launch files only
+    # showing a configure event, but that assumption was wrong: the node
+    # sat in 'inactive' indefinitely (confirmed via RViz showing zero TF
+    # from any link, and the node never publishing /tf or /map). It needs
+    # an explicit ACTIVATE transition, fired only once configure has
+    # actually finished -- waiting for the node to reach 'inactive'
+    # (configure's target state) rather than firing both events
+    # immediately, which could send ACTIVATE before CONFIGURE completes
+    # and have it silently ignored.
+    activate_event = EmitEvent(
+        event=ChangeState(
+            lifecycle_node_matcher=matches_action(slam_toolbox_node),
+            transition_id=Transition.TRANSITION_ACTIVATE,
+        ),
+        condition=IfCondition(autostart),
+    )
+
+    configure_to_active = RegisterEventHandler(
+        OnStateTransition(
+            target_lifecycle_node=slam_toolbox_node,
+            goal_state='inactive',
+            entities=[activate_event],
+        )
+    )
+
     localization = GroupAction([
         PushRosNamespace(NAMESPACE),
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(
-                PathJoinSubstitution([pkg_slam_toolbox, 'launch', 'localization_launch.py'])
-            ),
-            launch_arguments=[
-                ('use_sim_time',     LaunchConfiguration('use_sim_time')),
-                ('slam_params_file', PARAMS),
-            ]
-        ),
+        slam_toolbox_node,
+        configure_event,
+        configure_to_active,
     ])
-    return [localization]
 
-def generate_launch_description():
     ld = LaunchDescription(ARGUMENTS)
-    ld.add_action(OpaqueFunction(function=launch_setup))
+    ld.add_action(localization)
     return ld
