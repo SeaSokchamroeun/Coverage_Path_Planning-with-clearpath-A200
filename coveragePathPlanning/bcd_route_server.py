@@ -203,6 +203,38 @@ def downsample_path(path_rc, step_px):
     return out
 
 
+def greedy_shortcut(unsafe_grid, path_rc):
+    """Safety-checked greedy line-of-sight shortcutting on a raw grid
+    path (e.g. straight from local_astar/astar). Unlike downsample_path's
+    blind stride, every kept segment is verified via segment_clear --
+    this can never introduce an unsafe shortcut through an obstacle, it
+    can only remove genuinely redundant points the A* grid search added.
+
+    Was: downsample_path()'s stride sample, which picks every Nth raw
+    A* pixel with no check that the straight line BETWEEN two sampled
+    points stays clear. An A* path curves smoothly around an obstacle;
+    sampling it by blind stride and connecting those samples with
+    straight lines can zigzag back and forth in a way the original path
+    never did, since nothing verifies the shortcut segments are safe.
+    Found via a real connector between a spawn point and the first lane
+    waypoint: the fallback A* path was fine, but its downsampled output
+    visibly oscillated (multiple up/down reversals) before settling into
+    the actual route -- a sampling artifact, not a routing decision.
+    """
+    if len(path_rc) < 3:
+        return path_rc
+    out = [path_rc[0]]
+    i = 0
+    n = len(path_rc)
+    while i < n - 1:
+        j = n - 1
+        while j > i + 1 and not segment_clear(unsafe_grid, path_rc[i], path_rc[j]):
+            j -= 1
+        out.append(path_rc[j])
+        i = j
+    return out
+
+
 def connect_points(unsafe_grid, prev, pt, warnings):
     """General-purpose connector between two pixel points, used for both
     intra-cell lane transitions and inter-cell stitching. Tries, in order:
@@ -231,7 +263,7 @@ def connect_points(unsafe_grid, prev, pt, warnings):
     if detour is None:
         detour = astar(unsafe_grid, prev, pt)  # last-resort full search
     if detour is not None:
-        interior = downsample_path(detour, max(1, len(detour) // 4))[1:-1]
+        interior = greedy_shortcut(unsafe_grid, detour)[1:-1]
         return interior
 
     warnings.append(f"no clear connector between {prev} and {pt}")

@@ -52,9 +52,14 @@ from nav_msgs.msg import Path
 from nav2_simple_commander.robot_navigator import BasicNavigator, TaskResult
 
 
-NAMESPACE = "a200_1103"
-WAYPOINTS_FILE = "coverage_waypoints.yaml"
-HOME_POSE = (1.303262, 1.481998, 1.5707963267948966)  # top-right room spawn
+NAMESPACE = "a200_1103"  # override with --namespace if the serial changes
+WAYPOINTS_FILE = "coverage_waypoints_bcd.yaml"
+HOME_POSE = (0.0, 0.0, 0.0)  # office_mapEmpty / A200 spawn -- was the
+                              # TurtleBot world's (1.303262, 1.481998, pi/2),
+                              # carried over. It happened to fall inside the
+                              # office room so it never crashed, it just
+                              # drove to the wrong place at the end of every
+                              # run instead of actually going home.
 CONTROLLER_ID = "FollowPath"
 ROUTE_VIZ_TOPIC = "planned_coverage_route"
 
@@ -123,7 +128,12 @@ def run_segment_go_to_pose(navigator, p1):
     goal = make_pose(navigator, p1["x"], p1["y"], p1["yaw"])
     navigator.goToPose(goal)
     while not navigator.isTaskComplete():
-        pass
+        time.sleep(0.05)  # was a bare busy-wait, pinning a core at 100%
+                           # for the whole run -- on a machine also running
+                           # Gazebo this can itself starve controller_server
+                           # of CPU, which is a plausible contributor to the
+                           # "missed 20Hz, running at 5.1Hz" warning seen
+                           # earlier in this project's logs.
     return navigator.getResult() == TaskResult.SUCCEEDED
 
 
@@ -176,7 +186,16 @@ def run_follow_path_stall_aware(navigator, path, stall_timeout_s=STALL_TIMEOUT_S
 
 def main():
     rclpy.init(args=sys.argv)
-    navigator = BasicNavigator(namespace=NAMESPACE)
+
+    # --namespace overrides NAMESPACE -- e.g. `--namespace a200_2201` if the
+    # robot's serial changes. Parsed before BasicNavigator is constructed
+    # since the namespace has to be known at that point.
+    namespace = NAMESPACE
+    if "--namespace" in sys.argv:
+        namespace = sys.argv[sys.argv.index("--namespace") + 1]
+    print(f"Namespace: {namespace}")
+
+    navigator = BasicNavigator(namespace=namespace)
     navigator.set_parameters([
         rclpy.parameter.Parameter('use_sim_time', rclpy.Parameter.Type.BOOL, True)
     ])
@@ -225,7 +244,7 @@ def main():
                       history=QoSHistoryPolicy.KEEP_LAST)
     route_pub = navigator.create_publisher(Path, ROUTE_VIZ_TOPIC, qos)
     route_pub.publish(full_path)
-    print(f"Published planned route to '/{NAMESPACE}/{ROUTE_VIZ_TOPIC}' for RViz.")
+    print(f"Published planned route to '/{namespace}/{ROUTE_VIZ_TOPIC}' for RViz.")
 
     MAX_HOPS = 3
     # v5: followPath was being handed the ENTIRE remaining route on every
@@ -239,7 +258,23 @@ def main():
     # MPPI to actually make progress, while still getting multi-lane
     # smooth driving instead of falling back to single-waypoint goToPose
     # hops for the entire route.
-    FOLLOW_PATH_LOOKAHEAD = 4  # waypoints per followPath attempt (~2 lanes)
+    # v6: LOOKAHEAD dropped from 4 to 1. With 4, every window bundled one easy
+    # long ~11m straight cruise together with the plan's genuinely hardest
+    # maneuver -- a ~0.55m sideways hop requiring a full stop + sharp reversal
+    # right after the cruise built up speed. Every run this project has done,
+    # regardless of AMCL tuning or costmap settings, failed at exactly the
+    # same waypoints -- the ones sitting at that hop, always 1-2 waypoints
+    # after a window boundary. That consistency across otherwise-unrelated
+    # config changes is the signal that this was never a localization or
+    # costmap problem: it's followPath getting a cold-started MPPI optimizer
+    # and immediately demanding its hardest turn of the whole route. At
+    # LOOKAHEAD=1, each followPath call is exactly one segment -- easy
+    # straight segments stay smooth and precise via followPath; a hard
+    # reversal segment fails fast on its own and falls straight to goToPose's
+    # full global planner, which has reached every one of these points within
+    # 1-3 tries in every log we have. Costs a little continuous-driving
+    # smoothness; buys reliability on the segments that actually need it.
+    FOLLOW_PATH_LOOKAHEAD = 1
     failed_waypoints = []
     idx = 0
     n_waypoints = len(waypoints)
@@ -299,7 +334,7 @@ def main():
     home = make_pose(navigator, *HOME_POSE)
     navigator.goToPose(home)
     while not navigator.isTaskComplete():
-        pass
+        time.sleep(0.05)  # see note in run_segment_go_to_pose()
 
     if navigator.getResult() == TaskResult.SUCCEEDED:
         print(f"Back at {HOME_POSE[:2]}. Done.")
