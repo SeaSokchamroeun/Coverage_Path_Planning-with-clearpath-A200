@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+run_track*.csv
+run_nav*.log
+run_coverage_log*.txt
+*.backup
+--map
+--out
