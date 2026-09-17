@@ -1,186 +1,319 @@
-# Husky A200 — Automated Boundary & Coverage Path Planning
+# Coverage Path Planning — Clearpath Husky A200 (Nav2 / Jazzy)
 
-Autonomous indoor inspection pipeline for a Clearpath Husky A200: build a 2D occupancy map via SLAM,
-extract a room's drivable boundary from that map, generate a full-coverage floor path (Boustrophedon/BCD
-or Backtracking Spiral/BSA), drive it through Nav2, and verify the result against ground truth — not against
-how the plot looks.
+**Branch: `smooth-coverage-working`**
 
-Built against a six-phase task guide (Hardware Bringup → SLAM → Boundary Extraction → Coverage Path
-Planning → Nav2 Execution → Visualization/Validation). See **Status** below for where each phase stands.
+A full-coverage (boustrophedon) path-planning pipeline for the Clearpath Husky
+A200 on ROS 2 Jazzy + Nav2. The robot sweeps an entire room in a tidy
+back-and-forth pattern, follows the planned path precisely, and returns home.
 
-## Status snapshot
+**Verified result:** 6.8 ± 1.0 cm lateral RMSE across 10 runs, 100% coverage,
+zero backtracking.
 
-| Phase | Deliverable | Status |
-|---|---|---|
-| 1 — Hardware Bringup | Stable 2D LaserScan from the 3D Velodyne | PARTIAL |
-| 2 — SLAM & Mapping | Saved occupancy grid + localization | PARTIAL |
-| 3 — Route Server & Boundary | Node: `/map` → boundary waypoints | PARTIAL |
-| 4 — Coverage Path Planning | Waypoint array, full floor coverage | PARTIAL |
-| 5 — Nav2 Execution & Tracking | Autonomous execution + `/inspection_path` | PARTIAL |
-| 6 — Visualization & Validation | RViz Path display + MCAP logging | NOT MET |
+---
 
-The planning side (boundary extraction, coverage generation, verification) is the most mature part of the
-project — validated on two rooms with measured, ground-truth numbers. The execution side works reliably
-in simulation. The main structural gap across every phase is that the pipeline is still a set of offline Python
-scripts + a Python Action Client, not yet the live ROS 2 nodes (Route Server Action Server, path-tracking
-node, MCAP logging) the task guide specifies. See **Known issues & open work**.
-
-## Repository layout
+## Pipeline at a glance
 
 ```
-clearpath/
-├── robot.yaml, robot.urdf.xacro, robot.srdf(.xacro)   # Husky A200 platform description
-├── setup.bash                                         # source before any ros2 launch/run
-├── office_map.pgm / office_map.yaml                   # SLAM-built occupancy grid of the office
-├── localization_custom.launch.py / .yaml               # AMCL localization (primary)
-├── slam_toolbox_localization_launch.py / .yaml         # alt: SLAM Toolbox localization mode
-├── nav2_custom.launch.py / .yaml                        # Nav2 bringup
-├── log_localization_covariance.py                       # capture AMCL covariance over time
-├── summarize_covariance_log.py                           # summarize a covariance log
-├── world/                                                # Gazebo world file(s)
-├── platform/, sensors/, manipulators/, route/            # ClearPath-generated platform config
-└── coveragePathPlanning/                                 # boundary extraction + CPP + eval (below)
+1  Map        SLAM Toolbox drive        → office_mapEmpty.pgm + .yaml
+2  Boundary   extract_boundary.py       → room_boundary.yaml
+3  Coverage   generate_room_coverage_bcd_v2.py → coverage_waypoints_bcd.yaml
+4  Smooth     round_corners.py          → coverage_waypoints_smooth.yaml
+5  Preview    plot_smooth.py            → coverage_preview_smooth.png
+6  Run        run_coverage.py + record_run_a200.py → run_nav.log + run_track.csv
+7  Analyse    analyze_coverage_run_a200.py + analyze_trajectory.py → metrics + png
 ```
 
-## `coveragePathPlanning/` — pipeline scripts
+Every stage is an independent script consuming the previous stage's file, so
+the pipeline is easy to re-run and adapt to a new room or world.
 
-| Script | Role |
+---
+
+## Prerequisites
+
+```bash
+# ROS 2 Jazzy + Clearpath packages installed and sourced:
+source /opt/ros/jazzy/setup.bash && source ~/clearpath/setup.bash
+
+# Python deps for the planning/analysis scripts:
+pip install numpy scipy pyyaml pillow matplotlib
+
+# Confirm the robot namespace (used throughout as a200_1103):
+ros2 topic list | grep -m1 a200
+```
+
+All commands below run from `~/clearpath/coveragePathPlanning`. Replace
+`a200_1103` with your robot's namespace and `office_mapEmpty` with your map name.
+
+---
+
+## Stage 1 — Build and save the map
+
+Only needed once per world. If you already have a saved map, skip to Stage 2.
+
+**Launch simulation, SLAM, and teleop in three terminals:**
+
+```bash
+# Terminal 1 — simulated world (spawn at 0,0,0)
+ros2 launch clearpath_gz simulation.launch.py world:=office x:=0.0 y:=0.0 yaw:=0.0
+
+# Terminal 2 — SLAM Toolbox in online mapping mode
+ros2 launch clearpath_nav2_demos slam.launch.py \
+  setup_path:=$HOME/clearpath/ use_sim_time:=true
+
+# Terminal 3 — keyboard teleop; drive the whole room slowly
+ros2 run teleop_twist_keyboard teleop_twist_keyboard \
+  --ros-args -r cmd_vel:=/a200_1103/cmd_vel
+```
+
+Drive the full perimeter and criss-cross the interior until RViz shows a clean,
+closed room. Then **save the map** (keep SLAM running):
+
+```bash
+ros2 run nav2_map_server map_saver_cli \
+  -t /a200_1103/map \
+  -f ~/clearpath/coveragePathPlanning/office_mapEmpty
+```
+
+This writes `office_mapEmpty.pgm` (image) and `office_mapEmpty.yaml` (metadata).
+The `-f` path is **without** extension.
+
+---
+
+## Stage 2 — Extract the room boundary
+
+Isolates one room from the map into a clean polygon, inset from the walls by the
+robot's footprint so no planned path can hit a wall.
+
+```bash
+python3 extract_boundary.py office_mapEmpty.yaml \
+  --seed -0.6 1.0 \
+  --bbox -6.9 -3.8 5.7 5.9 \
+  --robot-radius 0.71 --margin 0.15 \
+  --out room_boundary.yaml \
+  --debug-image boundary_debug.png
+```
+
+| Parameter | Meaning |
 |---|---|
-| `extract_boundary.py` | Flood-fills free space from a seed point inside the room, erodes it by robot radius + margin, and writes `room_boundary.yaml`. Won't leak through doorways (bounding-box clipped). |
-| `bcd_route_server.py` | Tier-2 core: whole-map boustrophedon cellular decomposition (BCD), plus the shared low-level primitives (A*, `connect_points`, `is_safe`, `segment_clear`) every other script imports. Can also run standalone as a **multi-room** generator — edit the constants at the top of the file (`PGM_PATH`, `SPAWN_WORLD`, etc.), no CLI flags. |
-| `generate_room_coverage_bcd.py` | **Primary generator.** Boustrophedon (lawnmower) coverage for a *single* room: two-layer lane sweep, multi-interval column handling, clearance repair, coverage verification. Writes `coverage_waypoints.yaml`. |
-| `generate_room_coverage_bsa.py` | Backtracking Spiral Algorithm — comparison candidate. Same map/boundary/robot params/clearance repair as the BCD generator (only the guidance-track step differs). Never touches `coverage_waypoints.yaml`; writes `coverage_waypoints_bsa.yaml`. |
-| `coverage_common.py` | Algorithm-agnostic shared layer: boundary I/O, path simplify/smooth/clearance-repair, coverage verification, debug + preview image writers. Both generators import from here so a fix in one never breaks the other. |
-| `manhattan_utils.py` | Strict axis-aligned (4-connected, 90°-only) A* and path-simplify variants, for stitches that must not cut diagonally. |
-| `plot_coverage.py` | Static sanity-check plot: boundary + waypoints → PNG, before trusting anything in sim. |
-| `plot_coverage_preview.py` | Regenerate a labeled preview PNG from an *existing* waypoints file, without rerunning the generator. |
-| `check_defect_corner.py` | Focused clearance check at a known problem coordinate; compares candidates side by side to tell a real map-scale pinch apart from an algorithm artifact. |
-| `run_coverage.py` | Nav2 execution driver. Drives the route in short segments (`followPath`, falling back to `goToPose` on a stall), returns home at the end, logs every skipped waypoint. |
-| `analyze_coverage_run.py` | Parses a `run_coverage.py` log and summarizes continuous-path attempts, stalls, replanning hops, skipped waypoints, and final outcome. |
-| `evaluate_coverage_path.py` | Standardized metrics for any `coverage_waypoints.yaml`: coverage %, path length, waypoint/turn count, sharp-turn %, overlap %, estimated time. Supports `--compare` across multiple candidates. |
+| `office_mapEmpty.yaml` | The map to read (positional). |
+| `--seed X Y` | A point **inside** the target room; flood-fill starts here. For office_mapEmpty use its centre `-0.6 1.0`. **Change this per room.** |
+| `--bbox XMIN YMIN XMAX YMAX` | Clip box just inside the outer walls, so the fill doesn't leak through doorways. |
+| `--robot-radius` | Footprint circumscribing radius. **0.71 m** for the A200 (from its 0.55×0.45 m footprint half-extents) — NOT the bare chassis value, or the robot wedges on turns. |
+| `--margin` | Extra safety inset (0.15 m). |
+| `--out` | Output polygon → Stage 3. |
+| `--debug-image` | Preview PNG — **always check it** shows a clean rectangle with no doorway leak. |
 
-## Quick start — full pipeline for one room
+> **Note:** For a single clean rectangular room like `office_mapEmpty`, the
+> boundary is optional — Stage 3 can plan directly on the map. The boundary
+> matters when a map has multiple rooms or doorway gaps.
+
+---
+
+## Stage 3 — Generate the coverage path
+
+Boustrophedon cellular decomposition → evenly spaced parallel lanes.
 
 ```bash
-cd ~/clearpath/coveragePathPlanning
-
-# 1. Boundary
-python3 extract_boundary.py office_map.yaml \
-  --seed 7.5 5.95 --bbox 0.6 0.5 14.4 11.4 \
-  --robot-radius 0.4 --margin 0.1 \
-  --out room_boundary.yaml --debug-image boundary_debug.png
-
-# 2. Coverage path (Boustrophedon/BCD baseline)
-python3 generate_room_coverage_bcd.py \
-  --map office_map.yaml --boundary room_boundary.yaml \
-  --out coverage_waypoints.yaml --spawn 1.303262 1.481998
-
-#    ...or the BSA candidate, side by side:
-python3 generate_room_coverage_bsa.py \
-  --map office_map.yaml --boundary room_boundary.yaml \
-  --spawn 1.303262 1.481998 --out coverage_waypoints_bsa.yaml
-
-# 3. Preview before trusting it in sim
-python3 plot_coverage.py --boundary room_boundary.yaml \
-  --waypoints coverage_waypoints.yaml --out coverage_preview.png
+python3 generate_room_coverage_bcd_v2.py \
+  --map office_mapEmpty.yaml \
+  --boundary room_boundary.yaml \
+  --out coverage_waypoints_bcd.yaml \
+  --spawn 0 0 \
+  --robot-radius 0.71 --safety-margin 0.15
 ```
 
-Then bring up the stack (each in its own terminal, `source ~/clearpath/setup.bash` first):
+(Omit `--boundary` to plan on the whole map — works for a single clean room.)
+
+| Parameter | Meaning |
+|---|---|
+| `--map` | Occupancy grid to plan over. |
+| `--boundary` | Room polygon from Stage 2 (optional). |
+| `--out` | Output waypoints. |
+| `--spawn X Y` | Robot start pose; path is ordered to begin near here. **Match your sim spawn.** |
+| `--robot-radius` | Obstacle-inflation radius (0.71 m; match the boundary). |
+| `--safety-margin` | Extra inflation (0.15 m). Total inflation = radius + margin = 0.86 m. |
+| `--coverage-width` | Cleaned strip width (default 0.67 m = A200 chassis). |
+| `--overlap` | Overlap between lanes (default 0.10 m). Lane spacing = coverage_width − overlap. |
+| `--lane-axis` | `auto` / `x` / `y`. `auto` runs lanes along the longer axis to minimise turns. |
+
+Expect: `Obstacle inflation: ... = 0.86 m`, `~99–100% coverage`, ~34 waypoints
+(x-axis lanes). Auto-saves `coverage_preview_bcd.png` and `coverage_debug.png`.
+
+**Optional — y-axis lanes** (more turns, useful for comparison):
+```bash
+python3 generate_room_coverage_bcd_v2.py --map office_mapEmpty.yaml \
+  --out coverage_waypoints_bcd_y.yaml --spawn 0 0 \
+  --robot-radius 0.71 --safety-margin 0.15 --lane-axis y
+```
+
+---
+
+## Stage 4 — Smooth the corners (key step)
+
+Replaces the sharp ~180° point-turns at each lane end with rounded arcs the
+controller can drive through at speed. This is what eliminates stalls and
+backtracking and roughly halves worst-case tracking error.
 
 ```bash
-# Gazebo
-ros2 launch clearpath_gz simulation.launch.py world:=office \
-  x:=1.303262 y:=1.481998 yaw:=1.5707963267948966
+python3 round_corners.py \
+  --in coverage_waypoints_bcd.yaml \
+  --map office_mapEmpty.yaml \
+  --out coverage_waypoints_smooth.yaml \
+  --radius 0.4 --arc-step 0.1
+```
 
-# Localization
-ros2 launch ~/clearpath/localization_custom.launch.py \
-  map:=$HOME/clearpath/coveragePathPlanning/office_map.yaml use_sim_time:=true
+| Parameter | Meaning |
+|---|---|
+| `--in` | Raw waypoints from Stage 3. |
+| `--map` | Map, used to collision-check every arc (unsafe arcs are left sharp). |
+| `--out` | Smoothed waypoints. |
+| `--radius` | U-turn radius (0.4 m). Larger = gentler but needs more space; must be < wall clearance. |
+| `--arc-step` | Spacing of arc points (0.1 m). Smaller = smoother. |
+| `--min-angle` | Only round corners sharper than this (default 30°). |
 
-# RViz
+Expect: `corners rounded: 31`, `skipped (unsafe): 0`, `34 -> 158 waypoints`.
+
+> **If many corners are skipped as unsafe:** the lane ends sit too close to the
+> walls. Regenerate Stage 3 with a larger `--safety-margin` (e.g. 0.2) so the
+> arcs have room, or reduce `--radius`.
+
+---
+
+## Stage 5 — Preview the smoothed path
+
+```bash
+python3 plot_smooth.py \
+  --waypoints coverage_waypoints_smooth.yaml \
+  --map office_mapEmpty.yaml \
+  --out coverage_preview_smooth.png
+```
+
+`plot_smooth.py` draws the path over the real map with equal axis scaling, so
+the U-turn arcs render undistorted. Confirm a clean lawnmower pattern with
+rounded ends, no wall clips, before driving.
+
+---
+
+## Stage 6 — Configure the stack and run
+
+**Launch order** (each config file is read once at launch — relaunch to apply changes):
+
+```bash
+# 1. Simulation (spawn must match Stage 3 --spawn)
+ros2 launch clearpath_gz simulation.launch.py world:=office x:=0.0 y:=0.0 yaw:=0.0
+
+# 2. RViz
 ros2 launch clearpath_viz view_navigation.launch.py namespace:=a200_1103
 
-# Nav2
+# 3. Localisation (AMCL)
+ros2 launch ~/clearpath/localization_custom.launch.py \
+  map:=$HOME/clearpath/coveragePathPlanning/office_mapEmpty.yaml use_sim_time:=true
+
+# 4. Nav2
 ros2 launch ~/clearpath/nav2_custom.launch.py use_sim_time:=true
 ```
 
-Verify `controller_server` and `planner_server` both report `active [3]` (run the lifecycle checks one at a
-time or as a loop — pasting several on one line interleaves their output and looks like a false failure), then
-run a single-goal sanity check before committing to the full sweep. Once Nav2 is confirmed healthy:
+**Verify config is live** before trusting a run:
+```bash
+ros2 topic info /a200_1103/map                                          # Publisher count: 1
+ros2 lifecycle get /a200_1103/amcl                                      # active [3]
+ros2 param get /a200_1103/global_costmap/global_costmap rolling_window  # False
+```
+
+**Set the initial pose** (identity orientation for yaw=0 spawn):
+```bash
+ros2 topic pub --once /a200_1103/initialpose \
+  geometry_msgs/msg/PoseWithCovarianceStamped \
+  "{header: {frame_id: 'map'}, pose: {pose: {position: {x: 0.0, y: 0.0, z: 0.0},
+    orientation: {x: 0.0, y: 0.0, z: 0.0, w: 1.0}}}}"
+
+# Confirm a stable map->odom transform before driving:
+ros2 run tf2_ros tf2_echo map odom --ros-args \
+  -r /tf:=/a200_1103/tf -r /tf_static:=/a200_1103/tf_static
+```
+
+**Record + drive** (two terminals — start the recorder FIRST):
+```bash
+# Terminal A — recorder (note the namespaced /tf remap). Wait for "first sample".
+python3 record_run_a200.py --namespace a200_1103 --out run_track_smooth.csv \
+  --ros-args -r /tf:=/a200_1103/tf -r /tf_static:=/a200_1103/tf_static
+
+# Terminal B — drive the SMOOTHED path
+python3 run_coverage.py --waypoints coverage_waypoints_smooth.yaml \
+  --stall-timeout 15 2>&1 | tee run_nav_smooth.log
+```
+
+| Parameter | Meaning |
+|---|---|
+| `run_coverage.py --waypoints` | Path to drive (use the smoothed file). |
+| `run_coverage.py --stall-timeout` | Seconds without progress before a segment is re-planned (15). |
+| `record_run_a200.py --out` | Trajectory CSV. |
+| `record_run_a200.py --truth-topic` | Optional Gazebo ground-truth topic, to separate localisation from tracking error. |
+
+---
+
+## Stage 7 — Analyse the run
 
 ```bash
-cd ~/clearpath/coveragePathPlanning
-python3 run_coverage.py 2>&1 | tee run_coverage_log.txt
-python3 analyze_coverage_run.py --run-log run_coverage_log.txt
-python3 evaluate_coverage_path.py --map office_map.yaml --boundary room_boundary.yaml \
-  --waypoints coverage_waypoints.yaml
+# Navigation-stack health: stalls, replans, lost coverage
+python3 analyze_coverage_run_a200.py \
+  --run-log run_nav_smooth.log \
+  --waypoints coverage_waypoints_smooth.yaml
+
+# Tracking quality: RMSE, cross-track error, backtracking, smoothness
+python3 analyze_trajectory.py \
+  --track run_track_smooth.csv \
+  --waypoints coverage_waypoints_smooth.yaml \
+  --map office_mapEmpty.yaml \
+  --out run_track_smooth.png
 ```
 
-The full annotated version of this sequence (with expected output at each step and troubleshooting notes)
-lives in `run_sequence.txt`.
+**Metrics to check:**
 
-## File formats
+| Metric | Target |
+|---|---|
+| Coverage | 100% waypoints reached, returned home |
+| Lateral RMSE | < 10 cm |
+| Cross-track 95th percentile | < 27 cm (half lane spacing) |
+| Backtracking events | single digits (smoothed path → 0) |
+| Distance driven / planned | < ~1.15× |
 
-**`room_boundary.yaml`** — polygon corners in map frame, output by `extract_boundary.py`:
-```yaml
-corners:
-- [1.454, 10.538]
-- [1.454, 1.338]
-- [13.554, 1.338]
-- [13.554, 10.538]
-frame_id: map
-```
+---
 
-**`coverage_waypoints.yaml`** — ordered drive-through poses, the common schema every generator writes
-and every downstream script (`run_coverage.py`, `evaluate_coverage_path.py`, `plot_coverage.py`) reads:
-```yaml
-frame_id: map
-waypoints:
-- {x: 1.304, y: 1.488, yaw: 1.5487}
-- {x: 1.454, y: 8.288, yaw: -1.5708}
-```
+## Reusing in a new room or world
 
-**`office_map.yaml`** — standard ROS 2 `map_server`/SLAM Toolbox map metadata (`image`, `resolution`,
-`origin`, `negate`, `occupied_thresh`, `free_thresh`) alongside the paired `office_map.pgm` occupancy grid.
+Only these change per environment:
 
-## BCD vs. BSA — algorithm comparison
+| Value | Where |
+|---|---|
+| `world:=` , `x:= y:= yaw:=` | Stage 1 & 6 launch — the new world and spawn |
+| map name | rebuild in Stage 1, or reuse |
+| `--seed X Y` | Stage 2 — a point inside the new room |
+| `--bbox` | Stage 2 — the new room's extent |
+| `--spawn X Y` | Stage 3 — match the sim spawn |
+| `--robot-radius` / `--margin` | only if the robot footprint changes (keep 0.71 / 0.15 for a standard A200) |
 
-Both generators were run through an identical, fairness-controlled pipeline (same map, boundary, spawn
-pose, robot width/margin, and execution driver) on Room 2:
+---
 
-| Metric | Boustrophedon (BCD) | BSA |
-|---|---|---|
-| Coverage | 99.8% | 99.8% |
-| Waypoints | 69 | 34 |
-| Turns | 67 | 29 |
-| Real execution runtime | ≈28.6 min | ≈17.1 min |
-| Real failure rate | 2/69 (2.9%) | 1/34 (2.9%) |
+## Common pitfalls
 
-BCD has one hard failure point: a genuine map-scale pinch at world ≈(10.45, 8.5) where clearance bottoms
-out at 0.000 m — confirmed independent of any generator parameter via a 4-configuration stress test. BSA's
-coarse-cell placement lets it stand off that same pinch, but introduces its own single weak point instead: a
-98.7° turn at waypoint 14 where `goToPose` took 141 s to give up. **BSA is the current recommendation** for
-Room 2 — it matches BCD on coverage and reliability while being ~40% faster and structurally avoiding the
-BCD defect corner — with that one turn-geometry issue as the remaining open item before finalizing it.
+- **Editing a config changes nothing until you relaunch that node** — ROS reads params once at startup.
+- **Recorder started after the drive** → empty CSV. Always start it first and wait for "first sample".
+- **Spawn mismatch** between Gazebo, `--spawn`, and the initial pose → AMCL starts in the wrong place and the run drifts.
+- **Wrong world for the map** → the robot fights phantom or missing obstacles.
+- **Rolling global costmap** in a large room → far goals rejected as "outside bounds". Keep it static (`rolling_window: false`).
 
-## Known issues & open work
+---
 
-- **BSA waypoint 14** — 98.7° turn, 141 s stuck `goToPose`. Worth a targeted fix (wider corner-cut or a
-  brief reorient-in-place) before finalizing BSA as the Room 2 planner.
-- **BCD defect corner** — real map pinch at ≈(10.45, 8.5), 0.000 m clearance. Decision needed: accept,
-  special-case the one waypoint, or physically relocate the obstacle.
-- **Route Server is not a live node.** Boundary extraction and coverage generation are offline scripts, not a
-  ROS 2 Action Server subscribing to `/map` as the task guide specifies (Phase 3).
-- **No `/tf` → `/inspection_path` tracking node.** Only the pre-planned route is published once for RViz —
-  the actual driven trajectory isn't tracked or published (Phase 5.3), which also blocks the RViz Path
-  display and MCAP bag logging (Phase 6).
-- **3D point cloud isn't a second local-costmap layer yet** — obstacle checks currently rely on the 2D scan
-  slice only.
-- **Not yet scaled past two rooms.** Multi-room decomposition exists and was validated separately
-  (19 clean cells across all 4 rooms, 0 stitching warnings, via `bcd_route_server.py`), but isn't wired into
-  the per-room coverage generator yet.
+## Key scripts
 
-## Requirements
-
-- ROS 2 Humble Hawksbill or Jazzy Jalisco, Nav2, `clearpath_gz`, `clearpath_viz`
-- Python 3, with: `numpy`, `opencv-python`, `pyyaml`, `matplotlib`, `scipy`, `Pillow`,
-  `nav2_simple_commander`
+| Script | Role |
+|---|---|
+| `extract_boundary.py` | Flood-fills one room into a clean inset polygon. |
+| `generate_room_coverage_bcd_v2.py` | Boustrophedon decomposition → lane waypoints. |
+| `round_corners.py` | Rounds sharp lane-end turns into smooth arcs. |
+| `plot_smooth.py` | Previews a waypoints file over the map (undistorted). |
+| `run_coverage.py` | Drives the path via stall-aware followPath/goToPose. |
+| `record_run_a200.py` | Records the true executed trajectory to CSV. |
+| `analyze_coverage_run_a200.py` | Grades nav-stack health. |
+| `analyze_trajectory.py` | Grades tracking accuracy and smoothness. |
